@@ -1,5 +1,29 @@
-// ESP32 promiscuous sniffer — minimal ISR, worker thread does heavy parsing
-// Board: ESP32 (Arduino core)
+// ============================================================================
+// ESP32 Promiscuous Sniffer
+// Board   : ESP32 (Arduino core)
+// Author  : Jean Martial MARI
+// Affil.  : Université de la Polynésie française (UPF)
+// Year    : 2025
+// License : MIT (see LICENSE file in repository)
+//
+// Description:
+//   Minimal ESP32 Wi-Fi sniffer using promiscuous mode. 
+//   - Interrupt Service Routine (ISR) keeps work minimal (just queueing).
+//   - Worker FreeRTOS task parses and prints captured packets as JSON.
+//   - Extracts RSSI, channel, MAC addresses, sequence numbers, SSID,
+//     and vendor OUIs from management/data/control frames.
+//
+// Usage:
+//   - Configure MONITOR_CHANNEL to the Wi-Fi channel of interest.
+//   - Connect ESP32 via USB, open serial monitor at 115200 baud.
+//   - Packets are output as JSON lines for further processing
+//     (e.g., Python script `serial_probe_viewer.py`).
+//
+// Notes:
+//   - This is a research/educational tool, not for production use.
+//   - MIT licensed: free to use, copy, modify, and distribute.
+// ============================================================================
+
 #include <Arduino.h>
 #include "WiFi.h"
 #include "esp_wifi.h"
