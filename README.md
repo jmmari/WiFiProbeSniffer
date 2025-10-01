@@ -1,4 +1,4 @@
-# WiFi Probe Sniffer (ESP32/ESP8266 + Python)
+# WiFi Probe Sniffer (ESP32/ESP8266 + Python)          ONLY FOR WIFI CHANNEL 6 !
 An ESP32 WiFi Probe Sniffer with Python script for reading the detections
 
 Un petit outil pour **sniffer les Probe Requests Wi-Fi** avec un ESP32, 
