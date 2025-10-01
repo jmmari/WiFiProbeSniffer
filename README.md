@@ -1,7 +1,7 @@
 # WiFi Probe Sniffer (ESP32/ESP8266 + Python)
 An ESP32 WiFi Probe Sniffer with Python script for reading the detections
 
-Un petit outil pour **sniffer les Probe Requests Wi-Fi** avec un ESP32/ESP8266, 
+Un petit outil pour **sniffer les Probe Requests Wi-Fi** avec un ESP32, 
 et les afficher joliment sur PC (Windows/Linux/macOS) avec **Python**.  
 Affichage en **JSON coloré**, possibilité de **logger**, **prendre un snapshot**, et **effacer le buffer en mémoire**.
 
