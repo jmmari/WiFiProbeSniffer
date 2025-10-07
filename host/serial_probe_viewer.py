@@ -1,259 +1,350 @@
 #!/usr/bin/env python3
-# serial_probe_viewer.py
-#
-# JM MARI, Université de la Polynésie française (UPF), 2025
-#
-# Usage:
-#   Live mode   : python serial_probe_viewer.py COM3 115200
-#   Playback    : python serial_probe_viewer.py probes_log_1.jsonl
-# ------------------------------------------------------------------------
-# Probe Request / Wi-Fi Packet Fields Displayed
-#
-# TS        : Timestamp in milliseconds since ESP32 boot (relative clock).
-# MAC       : Source MAC address of the sender device.
-# RSSI      : Received Signal Strength Indicator (dBm). 
-#             - Closer devices → higher (less negative), e.g. -40 dBm = very strong.
-#             - Further devices → lower (more negative), e.g. -85 dBm = weak signal.
-# CH        : Wi-Fi channel (1–14 in 2.4 GHz; ESP32 only supports 2.4 GHz sniffing).
-# SEQ       : Sequence number from the 802.11 header.
-#             - Increases with each frame sent by a device.
-#             - Can be used to detect retransmissions or bursts.
-# SSID      : The SSID (network name) being probed.
-#             - "<hidden>" means the device is probing without specifying a network.
-#             - Otherwise shows the target Wi-Fi name the client is searching for.
-# VENDORS   : Vendor names inferred from the OUI (first 3 bytes of MAC address).
-#             - Helps identify the manufacturer (Apple, Samsung, Xiaomi, etc).
-#             - Multiple OUIs may appear if vendor-specific Information Elements (IEs) are present.
-#
-# Notes:
-# - Only management frames (like Probe Requests) are fully parsed here.
-# - Other frame types (data, beacons, control) are still captured but less detailed.
-# - RSSI and channel come from the ESP32 hardware radio (hdr_ch).
-# - Vendor lookup is approximate (based on known OUI table).
-#
-# Keyboard shortcuts in live mode:
-#   Ctrl-R : Toggle logging to a JSONL file (probes_log_N.jsonl).
-#   Ctrl-Q : Save current snapshot of recent probes to a file (snapshot_N.jsonl).
-#   Ctrl-W : Wipe in-memory buffer (clear screen + counters, files unaffected).
-#
-# Usage:
-#   Live sniffing : python serial_probe_viewer.py COM3 115200
-#   Playback log  : python serial_probe_viewer.py probes_log_1.jsonl
-# ------------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+serial_probe_viewer.py
+-----------------------------------------
+Author: JM Mari
+Affiliation: Université de la Polynésie française (UPF)
+Year: 2025
+License: MIT
 
-import sys, json, time, os, threading
+Description:
+  Enhanced live & playback viewer for ESP32 Wi-Fi Sniffer (JSON/JSONL output).
+  Designed to display Wi-Fi probe requests, management frames, and data frames
+  captured by an ESP32 running in promiscuous mode with channel hopping enabled.
+
+  The viewer supports:
+    - Live serial streaming from ESP32 via COM port
+    - Playback from JSONL capture files
+    - Per-channel grouping and filtering
+    - Real-time colored console display
+    - Interactive keyboard shortcuts (logging, snapshots, clearing)
+    - Vendor name inference from OUI (MAC prefix)
+
+------------------------------------------------------------------------------
+Usage examples:
+------------------------------------------------------------------------------
+
+  🟢 Live mode (direct serial read)
+      python serial_probe_viewer.py COM4 921600
+
+  🟠 File playback (read previously logged file)
+      python serial_probe_viewer.py captures.jsonl
+
+  🔵 Filter to one Wi-Fi channel only
+      python serial_probe_viewer.py COM4 921600 --channel 6
+
+  🟣 Show N last detections per channel (default 20)
+      python serial_probe_viewer.py COM4 921600 --nlast 15
+
+------------------------------------------------------------------------------
+Command-line options:
+------------------------------------------------------------------------------
+
+  target         : Serial port (e.g. COM4, /dev/ttyUSB0) or JSONL filename.
+  baud           : Baud rate for serial mode (default: 921600).
+  --channel, -ch : Display only packets from the specified Wi-Fi channel (1–13).
+  --nlast, -n    : Number of last detections to display per channel (default: 20).
+
+------------------------------------------------------------------------------
+Keyboard shortcuts (live mode):
+------------------------------------------------------------------------------
+
+  Ctrl-R : Toggle JSON logging (write to probes_log_N.jsonl).
+  Ctrl-Q : Save current snapshot of buffer (snapshot_N.jsonl).
+  Ctrl-W : Clear in-memory buffer and counters.
+  Ctrl-C : Quit program safely (close serial/log files).
+
+------------------------------------------------------------------------------
+Displayed fields:
+------------------------------------------------------------------------------
+
+  CH       : Wi-Fi channel (1–13).
+  TS       : Timestamp in milliseconds since ESP32 boot.
+  MAC      : Source MAC address of the device.
+  RSSI     : Received Signal Strength Indicator (dBm).
+             - Strong signal  → closer device  (e.g., -40 dBm = very near)
+             - Weak signal    → farther device (e.g., -85 dBm = far)
+  SEQ      : Sequence number of the frame (if provided by sniffer).
+  SSID     : Network name being probed (or "<hidden>" if not broadcast).
+  VENDORS  : Manufacturer inferred from MAC OUI (first 3 bytes).
+
+------------------------------------------------------------------------------
+Dependencies:
+------------------------------------------------------------------------------
+
+  pip install pyserial colorama
+
+------------------------------------------------------------------------------
+Notes:
+------------------------------------------------------------------------------
+  - Only works with ESP32 firmwares that print JSON lines to the serial port.
+  - Color output is terminal-friendly (Windows PowerShell, Linux, macOS).
+  - Playback mode accepts files with one JSON object per line (.jsonl).
+  - Vendor lookup is approximate and uses the OUI prefix.
+  - RSSI and channel fields are hardware-reported by the ESP32 radio.
+  - Works with all ESP32 channel hopping configurations (1–13 or custom).
+------------------------------------------------------------------------------
+"""
+
+import sys, os, json, time, threading, argparse
 from collections import deque, Counter
 from colorama import init, Fore, Style
 import serial.tools.list_ports
 
-def auto_detect_port():
-    ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        print("Aucun port série détecté. Branchez l'ESP32/ESP8266.")
-        sys.exit(1)
-    if len(ports) == 1:
-        return ports[0].device
-    print("Ports disponibles :")
-    for p in ports:
-        print("  ", p.device, "-", p.description)
-    # si plusieurs → demande à l’utilisateur
-    choice = input("Entrez le port à utiliser (ex: COM3): ").strip()
-    return choice
-
 init(autoreset=True)
-# --- Extended OUI table (common vendors incl. many Chinese vendors) ---
+
+# ------------------------------------------------------------------------
+# CLI arguments
+# ------------------------------------------------------------------------
+parser = argparse.ArgumentParser(
+    description="ESP32 Wi-Fi sniffer viewer with per-channel display",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
+parser.add_argument("target", nargs="?", help="Serial port (e.g. COM4) or JSONL file for playback.")
+parser.add_argument("baud", nargs="?", type=int, default=921600, help="Serial baudrate for live mode.")
+parser.add_argument("--channel", "-ch", type=int, help="Display only packets from this Wi-Fi channel (1–13).")
+parser.add_argument("--nlast", "-n", type=int, default=5, help="Number of detections shown per channel.")
+args = parser.parse_args()
+
+# ------------------------------------------------------------------------
+# Vendor lookup table (short version placeholder)
+# ------------------------------------------------------------------------
 OUI_TABLE = {
-    "0050F2": "Microsoft",
-    "506F9A": "Apple",
-    "3C5A37": "Google",
-    "F0D1A9": "Intel",
-    "000C29": "VMware",
-    "B827EB": "Raspberry Pi",
-    "A45E60": "Espressif",
-    "00163E": "Apple (old)",
-    "00050D": "Ubiquiti",
-    "D83062": "Xiaomi",
-    "F4F5D8": "Huawei",
-    "0017F2": "TP-Link/Arcadyan",
-    "001018": "Cisco",
-    "0013EF": "Dell",
-    "001B63": "Samsung",
-    "000FAC": "Qualcomm Atheros",
-    "0022F7": "Realtek",
-    "74:DA:38".replace(":",""): "MediaTek",
-    "7426B9": "MediaTek",
-    "0019D2": "D-Link",
-    "F4:F5:E8".replace(":",""): "Honor/Huawei",
-    "5C:49:79".replace(":",""): "Xiaomi",
-    "A4:C3:F0".replace(":",""): "Sony",
-    "90:9F:33".replace(":",""): "Lenovo",
-    "50:67:F3".replace(":",""): "TP-Link",
-    "E0:37:2C".replace(":",""): "Amazon",
-    "B4:0B:2F".replace(":",""): "Samsung",
-    "30:83:98".replace(":",""): "Xiaomi",
-    "38:2C:4A".replace(":",""): "LG Electronics",
-    "F8:1A:67".replace(":",""): "OPPO",
-    "84:38:35".replace(":",""): "Xiaomi",
+    # --- Infrastructure & Networking ---
+    "001018": "Cisco Systems",
     "00E04C": "Cisco Systems",
-    "001A11": "AVM (Fritz!)",
-    "000E08": "Hewlett Packard",
-    "0024D7": "HP Inc",
-    "FCF5C4": "Xiaomi",
-    "74DA38": "MediaTek",
-    "A40B83": "Huawei",
-    "0013EF": "Dell",
-    "9C:0E:3F".replace(":",""): "Xiaomi",
-    "60:57:18".replace(":",""): "Xiaomi",
-    "54:EE:75".replace(":",""): "TP-Link",
     "00D0B0": "Cisco Systems",
     "000E2B": "Broadcom",
-    "001BCAF5"[:6]: "Broadcom",
-    # fallback examples
-    "E4:5F:01".replace(":",""): "Xiaomi",
-    "4C:65:A8".replace(":",""): "Hon Hai/Foxconn",
-    "FCF5C4": "Xiaomi",
-    "0C:5B:C2".replace(":",""): "Realtek",
-    # ... you can extend this dict with more OUIs ...
+    "001BCA": "Broadcom",
+    "00050D": "Ubiquiti Networks",
+    "001A11": "AVM (Fritz!Box)",
+    "0017F2": "TP-Link / Arcadyan",
+    "50:67:F3".replace(":", ""): "TP-Link",
+    "54:EE:75".replace(":", ""): "TP-Link",
+    "0019D2": "D-Link",
+    "001018": "Cisco Systems",
+    "00163E": "Apple (old)",
+    "0022F7": "Realtek Semiconductor",
+    "0C5BC2": "Realtek Semiconductor",
+    "F0D1A9": "Intel Corporation",
+    "0018E7": "Intel Corporation",
+    "A45E60": "Espressif Systems (ESP32)",
+    "B827EB": "Raspberry Pi Foundation",
+    "3C5A37": "Google (Nest, Pixel)",
+    "000FAC": "Qualcomm Atheros",
+    "E8E5D6": "Qualcomm Technologies",
+    "F09FC2": "Qualcomm Technologies",
+
+    # --- PC & IT manufacturers ---
+    "0013EF": "Dell Inc.",
+    "000C29": "VMware Inc.",
+    "000E08": "Hewlett-Packard",
+    "0024D7": "HP Inc.",
+    "001018": "Cisco Systems",
+    "90:9F:33".replace(":", ""): "Lenovo",
+    "A4:C3:F0".replace(":", ""): "Sony Corporation",
+    "001018": "Cisco Systems",
+    "FC3FDB": "Microsoft Corporation",
+    "0050F2": "Microsoft Corporation",
+    "F8E079": "ASUSTek Computer",
+    "E0CB1D": "ASUSTek Computer",
+
+    # --- Smartphones / Tablets ---
+    "506F9A": "Apple Inc.",
+    "D4:61:9D".replace(":", ""): "Apple Inc.",
+    "F0:B4:29".replace(":", ""): "Apple Inc.",
+    "A4:83:E7".replace(":", ""): "Apple Inc.",
+    "30:07:4D".replace(":", ""): "Apple Inc.",
+    "001B63": "Samsung Electronics",
+    "B4:0B:2F".replace(":", ""): "Samsung Electronics",
+    "44:4E:1A".replace(":", ""): "Samsung Electronics",
+    "88:C6:26".replace(":", ""): "Samsung Electronics",
+    "F4:F5:E8".replace(":", ""): "Huawei / Honor",
+    "F4:F5:D8".replace(":", ""): "Huawei Technologies",
+    "A4:0B:83".replace(":", ""): "Huawei Technologies",
+    "D8:30:62".replace(":", ""): "Xiaomi / Redmi",
+    "84:38:35".replace(":", ""): "Xiaomi / Redmi",
+    "5C:49:79".replace(":", ""): "Xiaomi / Redmi",
+    "FC:F5:C4".replace(":", ""): "Xiaomi / Redmi",
+    "60:57:18".replace(":", ""): "Xiaomi / Redmi",
+    "9C:0E:3F".replace(":", ""): "Xiaomi / Redmi",
+    "E4:5F:01".replace(":", ""): "Xiaomi / Redmi",
+    "30:83:98".replace(":", ""): "Xiaomi / Redmi",
+    "38:2C:4A".replace(":", ""): "LG Electronics",
+    "F8:1A:67".replace(":", ""): "OPPO Mobile",
+    "00:6F:64".replace(":", ""): "OPPO Mobile",
+    "74:23:44".replace(":", ""): "Vivo Mobile",
+    "78:05:DC".replace(":", ""): "Vivo Mobile",
+    "7C:2E:BD".replace(":", ""): "OnePlus",
+    "BC:76:70".replace(":", ""): "OnePlus",
+    "E0:37:2C".replace(":", ""): "Amazon Technologies (Echo / Fire)",
+    "70:88:6B".replace(":", ""): "Amazon Technologies",
+    "A0:02:DC".replace(":", ""): "Google Nest / Chromecast",
+
+    # --- IoT / Wearables ---
+    "74:DA:38".replace(":", ""): "MediaTek Inc.",
+    "74:26:B9".replace(":", ""): "MediaTek Inc.",
+    "28:6A:BA".replace(":", ""): "MediaTek Inc.",
+    "4C:65:A8".replace(":", ""): "Hon Hai / Foxconn",
+    "00:1E:C0".replace(":", ""): "LG Innotek",
+    "88:4A:EA".replace(":", ""): "Fitbit / Google Wear",
+    "B8:27:EB".replace(":", ""): "Raspberry Pi Foundation",
+    "A4:CF:12".replace(":", ""): "Tuya Smart / IoT Devices",
+    "C8:2B:96".replace(":", ""): "Tuya Smart / IoT Devices",
+    "44:33:4C".replace(":", ""): "Wyze Labs / Smart Home",
+    "A0:20:A6".replace(":", ""): "Ring / Amazon Blink",
+    "FC:58:FA".replace(":", ""): "Sonos Inc.",
+
+    # --- Automotive & Misc ---
+    "F0:03:8C".replace(":", ""): "Tesla Motors",
+    "88:15:44".replace(":", ""): "Tesla Motors",
+    "84:FC:FE".replace(":", ""): "Volkswagen AG",
+    "78:24:AF".replace(":", ""): "BMW Group",
+    "A0:32:99".replace(":", ""): "Mercedes-Benz",
+    "58:91:CF".replace(":", ""): "Ford Motor Company",
+
+    # --- Generic fallback examples ---
+    "FCF5C4": "Xiaomi / Redmi",
+    "E45F01": "Xiaomi / Redmi",
+    "0C5BC2": "Realtek Semiconductor",
+    "E0D4E8": "Unknown IoT Device",
+    "AABBCC": "Generic Vendor Example"
 }
-# Normalize keys to uppercase without separators
+
+# Normalize keys (uppercase, no separators)
 OUI_TABLE = {k.upper().replace(":", "").replace("-", ""): v for k, v in OUI_TABLE.items()}
 
 def lookup_vendor(ouis: str) -> str:
+    """Return vendor name(s) from OUI hex list."""
     if not ouis:
         return ""
     names = []
     for part in ouis.split(","):
         key = part.strip().upper().replace(":", "")
-        if len(key) < 6:  # invalid OUI
-            names.append("Unknown")
+        if len(key) < 6:
             continue
-        names.append(OUI_TABLE.get(key, key))
+        names.append(OUI_TABLE.get(key[:6], key))
     return ",".join(names)
 
-# ------------------- Shared state -------------------
+# ------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------
+def auto_detect_port():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("❌ Aucun port série détecté.")
+        sys.exit(1)
+    if len(ports) == 1:
+        return ports[0].device
+    print("Ports disponibles :")
+    for i, p in enumerate(ports):
+        print(f"  [{i}] {p.device} - {p.description}")
+    sel = input("Choisissez un port (numéro) : ").strip()
+    try:
+        return ports[int(sel)].device
+    except:
+        return ports[0].device
+
+def color_rssi(rssi):
+    """Color-code RSSI for readability."""
+    try:
+        rssi = int(rssi)
+    except:
+        return str(rssi)
+    if rssi > -50:
+        return Fore.GREEN + str(rssi) + Style.RESET_ALL
+    elif rssi > -70:
+        return Fore.YELLOW + str(rssi) + Style.RESET_ALL
+    else:
+        return Fore.RED + str(rssi) + Style.RESET_ALL
+
+def color_channel(ch):
+    if ch <= 5:
+        return Fore.GREEN + f"{ch}" + Style.RESET_ALL
+    elif ch <= 9:
+        return Fore.YELLOW + f"{ch}" + Style.RESET_ALL
+    else:
+        return Fore.RED + f"{ch}" + Style.RESET_ALL
+
+# ------------------------------------------------------------------------
+# Data structures
+# ------------------------------------------------------------------------
 MAX_RECENT = 200
-recent = deque(maxlen=MAX_RECENT)
+recent_by_channel = {ch: deque(maxlen=MAX_RECENT) for ch in range(1, 15)}
 mac_counts = Counter()
 
-# ------------------- Pretty print -------------------
 def pretty_print():
+    """Print summary table grouped by channel."""
     print("\033[2J\033[H", end="")  # clear screen
-    print("Probe requests (most recent first) — total stored:", len(recent))
-    print("-" * 100)
-    print(f"{'TS':<8} {'MAC':<20} {'RSSI':>5} {'CH':>3} {'SEQ':>6} {'SSID':<22} {'VENDORS':<20}")
-    print("-" * 100)
-    for entry in list(recent)[-20:][::-1]:
-        ts = entry.get("ts", "")
-        mac = entry.get("mac", "")
-        rssi = entry.get("rssi", "")
-        ch = entry.get("hdr_ch", entry.get("channel", ""))
-        seq = entry.get("seq", "")
-        ssid = entry.get("ssid", "")
-        vendor_hex = entry.get("vendor", "")
-        vendor_names = lookup_vendor(vendor_hex)
-        # color RSSI
-        rssi_str = str(rssi)
-        if rssi != "":
-            try:
-                rssi_val = int(rssi)
-                if rssi_val > -50:
-                    rssi_str = Fore.GREEN + str(rssi) + Style.RESET_ALL
-                elif rssi_val > -70:
-                    rssi_str = Fore.YELLOW + str(rssi) + Style.RESET_ALL
-                else:
-                    rssi_str = Fore.RED + str(rssi) + Style.RESET_ALL
-            except:
-                pass
-        print(f"{str(ts):<8} {mac:<20} {rssi_str:>5} {str(ch):>3} {str(seq):>6} {ssid[:22]:<22} {vendor_names[:20]:<20}")
-    print("-" * 100)
-    print("Top MACs:")
-    for mac, c in mac_counts.most_common(10):
-        print(f"  {mac} : {c}")
-    print(Fore.CYAN + "\nPress Ctrl-C to quit." + Style.RESET_ALL)
-    print(Fore.CYAN + "      Ctrl-R : toggle logging (write to probes_log_N.jsonl)" + Style.RESET_ALL)
-    print(Fore.CYAN + "      Ctrl-Q : save snapshot (snapshot_N.jsonl)" + Style.RESET_ALL)
-    print(Fore.CYAN + "      Ctrl-W : clear in-memory buffer (does NOT delete files)" + Style.RESET_ALL)
+    print("Wi-Fi detections (grouped by channel)")
+    print("-" * 110)
+    print(f"{'CH':<3}   {'TS':<8} {'MAC':<20} {'RSSI':>5} {'SEQ':>6}     {'SSID':<22} {'VENDORS':<20}")
+    print("-" * 110)
+    for ch in range(1, 14):
+        if args.channel and ch != args.channel:
+            continue
+        entries = list(recent_by_channel[ch])[-args.nlast:]
+        for entry in entries[::-1]:
+            ts = entry.get("ts", "")
+            mac = entry.get("addr2") or entry.get("mac", "")
+            rssi = entry.get("rssi", "")
+            seq = entry.get("seq", "")
+            ssid = entry.get("ssid", "")
+            vendor_hex = entry.get("vendor", "")
+            vendor_names = lookup_vendor(vendor_hex)
+            print(f"{color_channel(ch):<3}   {str(ts):<8} {mac:<20}     {color_rssi(rssi):>5} {str(seq):>6}     {ssid[:22]:<22} {vendor_names[:20]:<20}")
+    print("-" * 110)
+    print(Fore.CYAN + "Top MACs:" + Style.RESET_ALL)
+    for mac, c in mac_counts.most_common(5):
+        print(f"  {mac:<20} {c:>4}")
+    print(Fore.CYAN + "\nCtrl-R: toggle log | Ctrl-Q: snapshot | Ctrl-W: clear | Ctrl-C: quit" + Style.RESET_ALL)
 
-#----------------------------------------------------------------------------------------------
-# --- Detect mode / arguments ---
-if len(sys.argv) > 1:
-    target = sys.argv[1]
-    is_file_mode = os.path.isfile(target)
-else:
-    target = None
-    is_file_mode = False
-
-
-if is_file_mode:
-    # -------- File playback --------
-    fname = target
-    print(f"Opening file {fname} for playback...")
+# ------------------------------------------------------------------------
+# File playback mode
+# ------------------------------------------------------------------------
+if args.target and os.path.isfile(args.target):
+    fname = args.target
+    print(f"Reading file {fname}...")
     with open(fname, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or "{" not in line:
                 continue
             try:
-                j = line.find("{")
-                obj = json.loads(line[j:])
-            except Exception:
+                obj = json.loads(line[line.find("{"):])
+            except:
                 continue
-            mac = obj.get("mac") or obj.get("addr") or obj.get("source")
-            if not mac:
+            ch = obj.get("ch", obj.get("hdr_ch", 0))
+            if args.channel and ch != args.channel:
                 continue
-            recent.append(obj)
-            mac_counts[mac] += 1
+            recent_by_channel.setdefault(ch, deque(maxlen=MAX_RECENT)).append(obj)
+            mac = obj.get("mac") or obj.get("addr2")
+            if mac:
+                mac_counts[mac] += 1
     pretty_print()
-    print(Fore.CYAN + f"\nDisplayed {len(recent)} events from {fname}" + Style.RESET_ALL)
+    print(Fore.GREEN + f"\nDisplayed {sum(len(q) for q in recent_by_channel.values())} detections." + Style.RESET_ALL)
     sys.exit(0)
 
-# -------- Live serial mode --------
+# ------------------------------------------------------------------------
+# Live serial mode
+# ------------------------------------------------------------------------
 import serial, msvcrt
 
-# Decide target and baudrate
-if target is None:
-    print("\nUsage:\nLive mode   : python serial_probe_viewer.py COM3 115200\nPlayback    : python serial_probe_viewer.py probes_log_1.jsonl\n")
-    print("\n=== Wi-Fi Probe Request Sniffer ===")
-    print("Usage examples:")
-    print("  Auto sniffing : python serial_probe_viewer.py")
-    print("  Live sniffing : python serial_probe_viewer.py COM3 115200")
-    print("  Playback log  : python serial_probe_viewer.py probes_log_1.jsonl\n")
-
-    print("Keyboard shortcuts (live mode):")
-    print("  Ctrl-R : toggle logging (write to probes_log_N.jsonl)")
-    print("  Ctrl-Q : save snapshot (snapshot_N.jsonl)")
-    print("  Ctrl-W : clear in-memory buffer (does NOT delete files)")
-    print("  Ctrl-C : quit\n")
-
-    print("Displayed parameters:")
-    print("  TS     : timestamp (ms since boot)")
-    print("  MAC    : source MAC address of the client")
-    print("  RSSI   : signal strength (dBm)")
-    print("  CH     : Wi-Fi channel")
-    print("  SEQ    : sequence number (frame counter per device)")
-    print("  SSID   : probed network name ('<hidden>' if none)")
-    print("  VENDORS: vendor inferred from MAC OUI\n")
-    # No args → auto detect port, assume 115200 baud
-    target = auto_detect_port()
-    PORT = target
-    BAUD = 115200
+if not args.target:
+    PORT = auto_detect_port()
+    BAUD = args.baud
 else:
-    # Normalize port
-    if target.upper().startswith("COM") or target.startswith("/dev/"):
-        PORT = target
-    else:
-        PORT = auto_detect_port()
-    BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 115200
+    PORT = args.target
+    BAUD = args.baud
 
-# Open serial
+print(f"Opening {PORT} @ {BAUD} baud...")
 ser = serial.Serial(PORT, BAUD, timeout=1)
-print(f"Opened {PORT} @ {BAUD}")
 
 logging_enabled = False
 log_file = None
 log_index = 1
 snapshot_index = 1
-
 
 def toggle_logging():
     global logging_enabled, log_file, log_index
@@ -262,7 +353,7 @@ def toggle_logging():
         fname = f"probes_log_{log_index}.jsonl"
         log_index += 1
         log_file = open(fname, "w", encoding="utf-8")
-        print(Fore.GREEN + f"\n>>> Logging enabled, writing to {fname}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"\n>>> Logging to {fname}" + Style.RESET_ALL)
     else:
         if log_file:
             log_file.close()
@@ -274,35 +365,39 @@ def save_snapshot():
     fname = f"snapshot_{snapshot_index}.jsonl"
     snapshot_index += 1
     with open(fname, "w", encoding="utf-8") as f:
-        for entry in recent:
-            f.write(json.dumps(entry) + "\n")
+        for ch in range(1, 14):
+            for entry in recent_by_channel[ch]:
+                f.write(json.dumps(entry) + "\n")
     print(Fore.CYAN + f"\n>>> Snapshot saved to {fname}" + Style.RESET_ALL)
 
 def key_listener():
-    global recent, mac_counts
     while True:
         if msvcrt.kbhit():
             key = msvcrt.getch()
             if key == b'\x12':   # Ctrl-R
                 toggle_logging()
-            elif key == b'\x11': # Ctrl-Q (instead of Ctrl-S)
+            elif key == b'\x11': # Ctrl-Q
                 save_snapshot()
             elif key == b'\x17': # Ctrl-W
-                recent.clear()
+                for q in recent_by_channel.values():
+                    q.clear()
                 mac_counts.clear()
-                print(Fore.MAGENTA + "\n>>> In-memory data cleared" + Style.RESET_ALL)
-
+                print(Fore.MAGENTA + "\n>>> Cleared in-memory data" + Style.RESET_ALL)
+        time.sleep(0.05)
 
 threading.Thread(target=key_listener, daemon=True).start()
 
-last_print = time.time()
+# ------------------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------------------
+last_refresh = time.time()
 try:
     while True:
         line = ser.readline()
         if not line:
-            if time.time() - last_print > 2:
+            if time.time() - last_refresh > 2:
                 pretty_print()
-                last_print = time.time()
+                last_refresh = time.time()
             continue
         try:
             s = line.decode(errors="ignore").strip()
@@ -311,23 +406,23 @@ try:
         if not s or "{" not in s:
             continue
         try:
-            j = s.find("{")
-            obj = json.loads(s[j:])
+            obj = json.loads(s[s.find("{"):])
         except Exception:
             continue
-        mac = obj.get("mac") or obj.get("addr") or obj.get("source")
-        if not mac:
+        ch = obj.get("ch", obj.get("hdr_ch", 0))
+        if args.channel and ch != args.channel:
             continue
-        recent.append(obj)
-        mac_counts[mac] += 1
+        recent_by_channel.setdefault(ch, deque(maxlen=MAX_RECENT)).append(obj)
+        mac = obj.get("mac") or obj.get("addr2")
+        if mac:
+            mac_counts[mac] += 1
         if logging_enabled and log_file:
             log_file.write(json.dumps(obj) + "\n")
             log_file.flush()
-        vendor_names = lookup_vendor(obj.get("vendor", ""))
-        print(f"[{obj.get('ts','')}] {mac} rssi={obj.get('rssi','')} ch={obj.get('hdr_ch', obj.get('channel',''))} ssid=\"{obj.get('ssid','')}\" vendors={vendor_names}")
-        if time.time() - last_print > 2:
+        if time.time() - last_refresh > 2:
             pretty_print()
-            last_print = time.time()
+            last_refresh = time.time()
+
 except KeyboardInterrupt:
     print("\nExiting.")
     if log_file:
