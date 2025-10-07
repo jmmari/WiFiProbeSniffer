@@ -19,7 +19,8 @@ On the host side, a **Python viewer** displays detections in real-time:
 - Vendor detection from MAC OUI prefixes  
 
 ---
-
+![Screenshot](output.png)
+---
 ## ⚙️ Features
 
 | Capability | Description |
