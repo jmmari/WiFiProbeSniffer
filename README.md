@@ -116,4 +116,4 @@ python acquireWiFiDetections.py -s | jq .
 ## 📜 License
 
 Released under the **MIT License**  
-© 2025 — Université de la Polynésie française (UPF) · Jean-Marie Mari
+© 2025 — Université de la Polynésie française (UPF) · Jean Martial Mari
