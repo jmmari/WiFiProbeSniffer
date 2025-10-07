@@ -10,7 +10,7 @@
 ## ✨ Overview
 
 This project turns your **ESP32** (or ESP8266) into a compact **Wi-Fi frame sniffer**.  
-It captures probe requests, management frames, and data packets, and streams them in **JSON** format to your computer.
+It captures probe requests, management frames, and data packets headers, and streams them in **JSON** format to your computer.
 
 On the host side, a **Python viewer** displays detections in real-time:
 - Colored RSSI levels (green → strong, red → weak)  
